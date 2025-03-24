@@ -1,11 +1,13 @@
 #include <stdio.h>
 #include <sys/socket.h>
+#include <poll.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <string.h>
 #include <errno.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 #define PANIC(message) {printf("Panic at %s:%d with message: %s\n", __FILE__, __LINE__, message); exit(EXIT_FAILURE);}
 #define PANIC_ERRNO() {PANIC(strerror(errno));}
@@ -147,6 +149,7 @@ typedef struct seechat_client_t
 typedef struct seechat_server_t 
 {
     int fd;
+    struct pollfd poll_fd;
     seechat_linked_list_t clients;
 } seechat_server_t;
 
@@ -161,6 +164,7 @@ typedef enum seechat_result_t
     SEECHAT_RESULT_ACCEPT_FAIL,
     SEECHAT_RESULT_CLOSE_FAIL,
     SEECHAT_RESULT_INIT_FAIL,
+    SEECHAT_RESULT_SET_NONBLOCK_FAIL,
     SEECHAT_RESULT_SIZE,
 } seechat_result_t;
 
@@ -174,6 +178,7 @@ const char* seechat_result_get_message(seechat_result_t result)
         case SEECHAT_RESULT_ACCEPT_FAIL: 
         case SEECHAT_RESULT_SOCKET_OPTIONS_FAIL: 
         case SEECHAT_RESULT_CLOSE_FAIL:
+        case SEECHAT_RESULT_SET_NONBLOCK_FAIL:
             return strerror(errno);
         case SEECHAT_RESULT_IP_CONVERSION_FAIL:
             return "Invalid IPv4 address";
@@ -195,6 +200,9 @@ seechat_result_t seechat_server_create(const char* bind_address, uint16_t bind_p
     result = setsockopt(server->fd, SOL_SOCKET, SO_REUSEADDR, &(int){1}, sizeof(int));
     if (result == -1) return SEECHAT_RESULT_SOCKET_OPTIONS_FAIL;
 
+    result = fcntl(server->fd, F_SETFL, fcntl(server->fd, F_GETFL, 0) | O_NONBLOCK);
+    if (result == -1) return SEECHAT_RESULT_SOCKET_FAIL;
+
     struct sockaddr_in addr_in = {0};
     addr_in.sin_port = htons(bind_port);
     addr_in.sin_family = AF_INET;
@@ -210,27 +218,42 @@ seechat_result_t seechat_server_create(const char* bind_address, uint16_t bind_p
 
     if (seechat_linked_list_create(&server->clients, free) != SEECHAT_LINKED_LIST_RESULT_SUCCESS) return SEECHAT_RESULT_INIT_FAIL;
 
+    server->poll_fd.fd = server->fd;
+    server->poll_fd.events = POLLIN;
+
     return SEECHAT_RESULT_SUCCESS;
+}
+
+void seechat_server_close_clients(seechat_server_t* server)
+{
+    seechat_linked_list_node_t* head = server->clients.begin;
+    while (head != NULL)
+    {
+        seechat_client_t* client = (seechat_client_t*)head->data;
+        close(client->fd);
+        head = head->next;
+    }
 }
 
 void seechat_server_free(seechat_server_t* server)
 {
+    seechat_server_close_clients(server);
     seechat_linked_list_free(&server->clients);
 }
 
-seechat_result_t seechat_server_listen(seechat_server_t* server, void(*client_callback)(seechat_client_t*)) 
+seechat_result_t seechat_server_accept(seechat_server_t* server) 
 {
     int result;
-    seechat_client_t client = {0};
+    seechat_client_t* client = (seechat_client_t*)calloc(1, sizeof(seechat_client_t));
 
-    result = accept(server->fd, &client.addr.addr, &client.addr_len);
+    result = accept(server->fd, &client->addr.addr, &client->addr_len);
     if (result == -1) return SEECHAT_RESULT_ACCEPT_FAIL;
 
-    client.fd = result;
-    client_callback(&client);
+    client->fd = result;
+    seechat_linked_list_append(&server->clients, (void*)client);
 
-    result = close(client.fd);
-    if (result == -1) return SEECHAT_RESULT_CLOSE_FAIL;
+    result = fcntl(client->fd, F_SETFL, fcntl(client->fd, F_GETFL, 0) | O_NONBLOCK);
+    if (result == -1) return SEECHAT_RESULT_SOCKET_FAIL;
 
     return SEECHAT_RESULT_SUCCESS;
 }
@@ -247,7 +270,25 @@ int main(void)
 {
     seechat_server_t server;
     EXECUTE_OR_PANIC(seechat_result_t result = seechat_server_create(BIND_ADDRESS, BIND_PORT, &server), result != SEECHAT_RESULT_SUCCESS, seechat_result_get_message(result));
-    EXECUTE_OR_PANIC(seechat_result_t result = seechat_server_listen(&server, seechat_client_callback), result != SEECHAT_RESULT_SUCCESS, seechat_result_get_message(result));
+
+    int activity;
+
+    while (1) // todo: listen to ^Z or something
+    {
+        EXECUTE_OR_PANIC_ERRNO(activity = poll(&server.poll_fd, 1, -1), activity == -1)
+        if (server.poll_fd.revents & POLLIN)
+        {
+            EXECUTE_OR_PANIC(seechat_result_t result = seechat_server_accept(&server), result != SEECHAT_RESULT_SUCCESS, seechat_result_get_message(result));
+        }
+        
+        seechat_linked_list_node_t* head = server.clients.begin;
+        while (head != NULL)
+        {
+            seechat_client_callback((seechat_client_t*)head->data);
+            head = head->next;
+        }
+    }
+
     seechat_server_free(&server);
     return EXIT_SUCCESS;
 }
