@@ -1,2 +1,2 @@
 all:
-	gcc -o app main.c
+	gcc -g -o app main.c
