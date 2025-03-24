@@ -43,6 +43,7 @@ typedef enum seechat_result_t
     SEECHAT_RESULT_BIND_FAIL,
     SEECHAT_RESULT_LISTEN_FAIL,
     SEECHAT_RESULT_ACCEPT_FAIL,
+    SEECHAT_RESULT_CLOSE_FAIL,
     SEECHAT_RESULT_SUCCESS,
     SEECHAT_RESULT_SIZE,
 } seechat_result_t;
@@ -56,15 +57,16 @@ const char* seechat_result_get_message(seechat_result_t result)
         case SEECHAT_RESULT_LISTEN_FAIL: 
         case SEECHAT_RESULT_ACCEPT_FAIL: 
         case SEECHAT_RESULT_SOCKET_OPTIONS_FAIL: 
+        case SEECHAT_RESULT_CLOSE_FAIL:
             return strerror(errno);
         case SEECHAT_RESULT_IP_CONVERSION_FAIL:
             return "Invalid IPv4 address";
-        default:
+            default:
             return "Missing error message";
     }
 }
 
-seechat_result_t seechat_create_server(const char* bind_address, uint16_t bind_port, seechat_server_t* server) 
+seechat_result_t seechat_server_create(const char* bind_address, uint16_t bind_port, seechat_server_t* server) 
 {
     int result;
     
@@ -91,24 +93,36 @@ seechat_result_t seechat_create_server(const char* bind_address, uint16_t bind_p
     return SEECHAT_RESULT_SUCCESS;
 }
 
+seechat_result_t seechat_server_listen(seechat_server_t* server, void(*client_callback)(seechat_client_t*)) 
+{
+    int result;
+    seechat_client_t client = {0};
+
+    result = accept(server->fd, &client.addr.addr, &client.addr_len);
+    if (result == -1) return SEECHAT_RESULT_ACCEPT_FAIL;
+
+    client.fd = result;
+    client_callback(&client);
+
+    result = close(client.fd);
+    if (result == -1) return SEECHAT_RESULT_CLOSE_FAIL;
+
+    return SEECHAT_RESULT_SUCCESS;
+}
+
+static void seechat_client_callback(seechat_client_t* client)
+{
+    printf("Accepted a client: %s:%d\n", inet_ntoa(client->addr.addr_in.sin_addr), ntohs(client->addr.addr_in.sin_port));
+    const char* message = "Hello Socket!\n";
+    size_t sent_to_client = send(client->fd, (const void*)message, strlen(message) + 1, 0);
+    printf("Sent %ld bytes to client\n", sent_to_client);
+}
+
 int main(void)
 {
     seechat_server_t server = {0};
-    EXECUTE_OR_PANIC(seechat_result_t result = seechat_create_server(BIND_ADDRESS, BIND_PORT, &server), result != SEECHAT_RESULT_SUCCESS, seechat_result_get_message(result));
-
-    printf("Listening on %s:%d\n", BIND_ADDRESS, BIND_PORT);
-
-    // seechat_client_t client = {0};
-    // EXECUTE_OR_PANIC_ERRNO(client.fd = accept(server.fd, &client.addr.addr, &client.addr_len), client.fd == -1);
-
-    // printf("Accepted a client: %s:%d\n", inet_ntoa(client.addr.addr_in.sin_addr), ntohs(client.addr.addr_in.sin_port));
-
-    // const char* message = "Hello Socket!\n";
-    // size_t sent_to_client = send(client.fd, (const void*)message, strlen(message) + 1, 0);
-
-    // printf("Sent %ld bytes to client\n", sent_to_client);
-
-    // EXECUTE_OR_PANIC_ERRNO(int result = close(client.fd), result == -1);
+    EXECUTE_OR_PANIC(seechat_result_t result = seechat_server_create(BIND_ADDRESS, BIND_PORT, &server), result != SEECHAT_RESULT_SUCCESS, seechat_result_get_message(result));
+    EXECUTE_OR_PANIC(seechat_result_t result = seechat_server_listen(&server, seechat_client_callback), result != SEECHAT_RESULT_SUCCESS, seechat_result_get_message(result));
 
     return EXIT_SUCCESS;
 }
