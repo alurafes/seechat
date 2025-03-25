@@ -135,6 +135,70 @@ void seechat_linked_list_free(seechat_linked_list_t* list)
     list->length = 0;
 }
 
+#define seechat_linked_list_foreach(list_ptr, action)\
+{\
+    seechat_linked_list_node_t* iterator = (list_ptr)->begin;\
+    while (iterator != NULL)\
+    {\
+        {action}\
+        iterator = iterator->next;\
+    }\
+}
+
+#define SEECHAT_STRING_BUILDER_INITIAL_CAPACITY (64)
+
+typedef enum seechat_string_builder_result_t
+{
+    SEECHAT_STRING_BUILDER_RESULT_SUCCESS,
+    SEECHAT_STRING_BUILDER_RESULT_ALLOCATE_FAIL,
+    SEECHAT_STRING_BUILDER_RESULT_SIZE
+} seechat_string_builder_result_t;
+
+typedef struct seechat_string_builder_t 
+{
+    char* data;
+    size_t length;
+    size_t capacity;
+} seechat_string_builder_t;
+
+seechat_string_builder_result_t seechat_string_builder_create(seechat_string_builder_t* string_builder)
+{
+    string_builder->capacity = SEECHAT_STRING_BUILDER_INITIAL_CAPACITY;
+    string_builder->length = 0;
+    string_builder->data = (char*)malloc(SEECHAT_STRING_BUILDER_INITIAL_CAPACITY);
+    if (string_builder->data == NULL) return SEECHAT_STRING_BUILDER_RESULT_ALLOCATE_FAIL;
+    string_builder->data[0] = '\0';
+    return SEECHAT_STRING_BUILDER_RESULT_SUCCESS;
+}
+
+seechat_string_builder_result_t seechat_string_builder_append(seechat_string_builder_t* string_builder, char* string)
+{
+    size_t string_length = strlen(string);
+
+    size_t required_capacity = string_builder->length + string_length + 1;
+    if (required_capacity > string_builder->capacity) {
+        string_builder->capacity = required_capacity * 2;
+        string_builder->data = realloc(string_builder->data, string_builder->capacity);
+        if (string_builder->data == NULL) return SEECHAT_STRING_BUILDER_RESULT_ALLOCATE_FAIL;
+    }
+
+    strcpy(string_builder->data + string_builder->length, string);
+    string_builder->length += string_length;
+
+    return SEECHAT_STRING_BUILDER_RESULT_SUCCESS;
+}
+
+void seechat_string_builder_clear(seechat_string_builder_t* string_builder)
+{
+    string_builder->length = 0;
+    string_builder->data[0] = '\0';
+}
+
+void seechat_string_builder_free(seechat_string_builder_t* string_builder)
+{
+    free(string_builder->data);
+}
+
 typedef struct seechat_client_t 
 {
     union 
@@ -144,6 +208,8 @@ typedef struct seechat_client_t
     } addr;
     int addr_len;
     int fd;
+    struct pollfd poll_fd;
+    seechat_string_builder_t read_buffer_sb;
 } seechat_client_t;
 
 typedef struct seechat_server_t 
@@ -231,6 +297,7 @@ void seechat_server_close_clients(seechat_server_t* server)
     {
         seechat_client_t* client = (seechat_client_t*)head->data;
         close(client->fd);
+        seechat_string_builder_free(&client->read_buffer_sb);
         head = head->next;
     }
 }
@@ -246,7 +313,7 @@ seechat_result_t seechat_server_accept(seechat_server_t* server)
     int result;
     seechat_client_t* client = (seechat_client_t*)calloc(1, sizeof(seechat_client_t));
 
-    result = accept(server->fd, &client->addr.addr, &client->addr_len);
+    result = accept(server->fd, &client->addr.addr, (socklen_t*)&client->addr_len);
     if (result == -1) return SEECHAT_RESULT_ACCEPT_FAIL;
 
     client->fd = result;
@@ -255,15 +322,38 @@ seechat_result_t seechat_server_accept(seechat_server_t* server)
     result = fcntl(client->fd, F_SETFL, fcntl(client->fd, F_GETFL, 0) | O_NONBLOCK);
     if (result == -1) return SEECHAT_RESULT_SOCKET_FAIL;
 
+    client->poll_fd.fd = client->fd;
+    client->poll_fd.events = POLLIN | POLLOUT | POLLHUP;
+
+    EXECUTE_OR_PANIC(seechat_string_builder_result_t result = seechat_string_builder_create(&client->read_buffer_sb), result != SEECHAT_STRING_BUILDER_RESULT_SUCCESS, "failed to initialize a client");
+
+    printf("Acceped a client %s:%d\n", inet_ntoa(client->addr.addr_in.sin_addr), ntohs(client->addr.addr_in.sin_port));
+
     return SEECHAT_RESULT_SUCCESS;
 }
 
-static void seechat_client_callback(seechat_client_t* client)
+static void seechat_client_callback(seechat_server_t* server, seechat_client_t* client)
 {
-    printf("Accepted a client: %s:%d\n", inet_ntoa(client->addr.addr_in.sin_addr), ntohs(client->addr.addr_in.sin_port));
-    const char* message = "Hello Socket!\n";
-    size_t sent_to_client = send(client->fd, (const void*)message, strlen(message) + 1, 0);
-    printf("Sent %ld bytes to client\n", sent_to_client);
+    EXECUTE_OR_PANIC_ERRNO(int activity = poll(&client->poll_fd, 1, 0), activity == -1);
+    char buffer[64] = {0};
+    int read_bytes = 0;
+
+    if (client->poll_fd.revents & POLLHUP)
+    {
+        // todo: kill client
+        return;
+    }
+
+    if (client->poll_fd.revents & POLLIN)
+    {
+        seechat_string_builder_clear(&client->read_buffer_sb);
+        while ((read_bytes = recv(client->fd, buffer, 64, 0)) > 0)
+        {
+            seechat_string_builder_append(&client->read_buffer_sb, buffer);
+            memset(buffer, 0, 64);
+        }
+        printf("data (%zu): %s\n", client->read_buffer_sb.length, client->read_buffer_sb.data);
+    }
 }
 
 int main(void)
@@ -271,22 +361,17 @@ int main(void)
     seechat_server_t server;
     EXECUTE_OR_PANIC(seechat_result_t result = seechat_server_create(BIND_ADDRESS, BIND_PORT, &server), result != SEECHAT_RESULT_SUCCESS, seechat_result_get_message(result));
 
-    int activity;
-
     while (1) // todo: listen to ^Z or something
     {
-        EXECUTE_OR_PANIC_ERRNO(activity = poll(&server.poll_fd, 1, -1), activity == -1)
+        EXECUTE_OR_PANIC_ERRNO(int activity = poll(&server.poll_fd, 1, 0), activity == -1)
         if (server.poll_fd.revents & POLLIN)
         {
             EXECUTE_OR_PANIC(seechat_result_t result = seechat_server_accept(&server), result != SEECHAT_RESULT_SUCCESS, seechat_result_get_message(result));
         }
-        
-        seechat_linked_list_node_t* head = server.clients.begin;
-        while (head != NULL)
-        {
-            seechat_client_callback((seechat_client_t*)head->data);
-            head = head->next;
-        }
+
+        seechat_linked_list_foreach(&server.clients, {
+            seechat_client_callback(&server, (seechat_client_t*)iterator->data);
+        });
     }
 
     seechat_server_free(&server);
